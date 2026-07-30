@@ -13,6 +13,7 @@ SETUP = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts" 
 def _run(args, *, home=None, extra_env=None):
     env = dict(os.environ)
     env.pop("WATCH_DETAIL", None)
+    env["WATCH_DISABLE_LOCAL_WHISPER"] = "1"
     # Don't let a real key in the developer's shell env leak into the test.
     env.pop("GROQ_API_KEY", None)
     env.pop("OPENAI_API_KEY", None)
@@ -40,6 +41,10 @@ def test_json_reports_watch_detail():
     proc = _run(["--json"])
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout)
+    assert "has_local_whisper" in data
+    assert "has_transcription_backend" in data
+    assert "diarization_available" in data
+    assert data["has_api_key"] is False
     assert data["watch_detail"] == "balanced"
 
 

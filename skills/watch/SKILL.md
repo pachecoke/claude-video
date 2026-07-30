@@ -1,19 +1,17 @@
 ---
 name: watch
-version: "0.2.0"
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
-argument-hint: "<video-url-or-path> [question]"
-allowed-tools: Bash, Read, AskUserQuestion
-homepage: https://github.com/bradautomates/claude-video
-repository: https://github.com/bradautomates/claude-video
-author: bradautomates
+description: Watch a video with frames, private local transcription, cloud fallbacks, and optional speaker diarization.
 license: MIT
-user-invocable: true
+metadata:
+  version: "0.3.0"
+  homepage: https://github.com/pachecoke/claude-video
+  repository: https://github.com/pachecoke/claude-video
+  author: Bradley Bonanno, maintained by Kevin Pacheco
 ---
 
 # /watch
 
-You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
+This skill gives an agent video context. It gets captions first, extracts frames as JPEGs, transcribes privately with faster-whisper when installed, falls back to configured cloud services, and can label speakers with an optional WhisperX environment.
 
 ## Resolve `SKILL_DIR` (do this before any command)
 
@@ -147,7 +145,13 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
+- `--whisper faster-whisper|groq|openai` - force a backend. Default order is local faster-whisper, Groq, then OpenAI.
+- `--diarize` - transcribe with the optional local WhisperX environment and label speakers.
+- `--diarize-model MODEL` - select the local Whisper model, default `large-v3`.
+- `--num-speakers N` - force an exact speaker count and override min/max.
+- `--min-speakers N` / `--max-speakers N` - bound automatic speaker detection.
+- `--diar-threshold F` - override the optional clustering threshold.
+- `--report-file PATH` - write the complete Markdown report as UTF-8, recommended for long transcripts.
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
@@ -166,7 +170,7 @@ Focused mode is the right call for:
 - Any video longer than ~10 minutes where the user's question is about a specific part — running focused on the relevant section is far more useful than a sparse scan of the whole thing.
 - Re-runs after a full scan didn't have enough detail in some region.
 
-Transcript is auto-filtered to the same range. Frame timestamps are absolute (real video timeline, not offset-from-start).
+Captions are filtered to the same range. Whisper and WhisperX extract only the requested audio range, then shift timestamps back to the absolute source timeline.
 
 Examples:
 ```bash
@@ -180,7 +184,7 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 2:15 --end 2:45 --fps 2
 python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 ```
 
-**Step 3 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript.
+**Step 3 - open every frame path with the image-viewing tool available in the current host.** Open frames together when possible. If the host cannot open local images, continue transcript-only and report that limitation. Frame timestamps are absolute.
 
 **Step 4 — answer the user.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
@@ -229,6 +233,30 @@ The script gets a timestamped transcript in one of two ways:
 
 Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
 
+### Local transcription and diarization
+
+Install private local transcription into the interpreter that runs `watch.py`:
+
+```bash
+python -m pip install -r "${SKILL_DIR}/requirements-local.txt"
+```
+
+WhisperX diarization is intentionally isolated because its PyTorch stack is
+large. Create a separate environment, install the correct PyTorch build for
+your CPU or GPU, then install `requirements-diarize.txt`. The verified CUDA
+baseline is PyTorch and Torchaudio `2.8.0+cu128`, WhisperX `3.8.6`, and
+pyannote.audio `4.0.7`. No model download is automated.
+
+Interpreter discovery checks `WATCH_DIARIZE_PYTHON`, then
+`~/whisperx-env/Scripts/python.exe`, then `~/whisperx-env/bin/python`.
+`WATCH_DIARIZE_SCRIPT` can override the bundled wrapper. Set `HF_TOKEN` only
+in the process environment or `~/.config/watch/.env`, after accepting the
+gated terms for `pyannote/speaker-diarization-community-1`. Never paste the
+token into a command, report, note, or repository file.
+
+`WATCH_CA_BUNDLE` optionally points model initialization at a corporate CA
+bundle. Without it, the active environment's Certifi bundle is used.
+
 ## Failure modes and handling
 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
@@ -266,3 +294,8 @@ If you already watched a video this session and the user asks a follow-up, do **
 **Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.
+The JSON object preserves the original fields and also reports `has_local_whisper`,
+`has_transcription_backend`, and `diarization_available`. Local faster-whisper is
+keyless and counts as a valid transcription backend. Diarization is optional.
+Keep `HF_TOKEN`, certificates, model caches, and virtual environments outside the
+plugin repository.

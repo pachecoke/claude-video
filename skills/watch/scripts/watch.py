@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """/watch entry point: download video, extract frames, parse transcript.
 
-Prints a markdown report to stdout listing frame paths + transcript. Claude
-then Reads each frame path to see the video.
+Prints a Markdown report to stdout or a UTF-8 report file. The host can open
+the listed frame paths with whichever image-viewing capability it provides.
 """
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from config import frame_cap, get_config  # noqa: E402
+from diarization import format_diarized_transcript, run_diarization  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import transcribe_video, transcription_backends  # noqa: E402
 
 
 def main() -> int:
@@ -56,9 +57,39 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["faster-whisper", "groq", "openai"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a backend. Default: faster-whisper, then Groq, then OpenAI.",
+    )
+    ap.add_argument(
+        "--diarize",
+        action="store_true",
+        help="Use optional local WhisperX transcription with speaker diarization.",
+    )
+    ap.add_argument(
+        "--diarize-model",
+        default="large-v3",
+        help="WhisperX/faster-whisper model name (default: large-v3).",
+    )
+    ap.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help="Exact diarization speaker count; overrides min/max.",
+    )
+    ap.add_argument("--min-speakers", type=int, default=None)
+    ap.add_argument("--max-speakers", type=int, default=None)
+    ap.add_argument(
+        "--diar-threshold",
+        type=float,
+        default=None,
+        help="Optional pyannote clustering threshold.",
+    )
+    ap.add_argument(
+        "--report-file",
+        type=str,
+        default=None,
+        help="Write the complete Markdown report as UTF-8.",
     )
     ap.add_argument(
         "--no-dedup",
@@ -67,6 +98,17 @@ def main() -> int:
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
     args = ap.parse_args()
+
+    for name in ("num_speakers", "min_speakers", "max_speakers"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise SystemExit(f"--{name.replace('_', '-')} must be greater than zero")
+    if (
+        args.min_speakers is not None
+        and args.max_speakers is not None
+        and args.min_speakers > args.max_speakers
+    ):
+        raise SystemExit("--min-speakers cannot exceed --max-speakers")
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -95,7 +137,7 @@ def main() -> int:
     video_path: str | None = None
 
     if url_source:
-        print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
+        print("[watch] checking metadata/captions via yt-dlp...", file=sys.stderr)
         dl = fetch_captions(args.source, work / "download")
         if dl.get("subtitle_path"):
             try:
@@ -109,13 +151,13 @@ def main() -> int:
     # --timestamps needs the video for frame grabs, so it overrides the
     # transcript-mode download skip (and forces a full, not audio-only, fetch).
     audio_only = detail == "transcript" and not cue_timestamps
-    if detail == "transcript" and transcript_segments and not cue_timestamps:
+    if detail == "transcript" and transcript_segments and not cue_timestamps and not args.diarize:
         video_path = None
     else:
         if url_source:
             print(
-                "[watch] downloading audio via yt-dlp…" if audio_only
-                else "[watch] downloading video via yt-dlp…",
+                "[watch] downloading audio via yt-dlp..." if audio_only
+                else "[watch] downloading video via yt-dlp...",
                 file=sys.stderr,
             )
             dl = download(
@@ -124,7 +166,7 @@ def main() -> int:
                 audio_only=audio_only,
             )
         else:
-            print("[watch] using local file…", file=sys.stderr)
+            print("[watch] using local file...", file=sys.stderr)
             dl = download(args.source, work / "download")
         video_path = dl["video_path"]
 
@@ -188,7 +230,7 @@ def main() -> int:
         if cue_meta.get("dropped_out_of_window"):
             print(
                 f"[watch] {cue_meta['dropped_out_of_window']} cue timestamp(s) outside the "
-                "focus range — dropped",
+                "focus range; dropped",
                 file=sys.stderr,
             )
 
@@ -198,7 +240,7 @@ def main() -> int:
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
         print(
             f"[watch] extracting {engine_label} over {scope} "
-            f"(target {target}, cap {cap_label})…",
+            f"(target {target}, cap {cap_label})...",
             file=sys.stderr,
         )
         if detail == "efficient":
@@ -227,6 +269,28 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
+    if args.diarize and video_path and meta.get("has_audio"):
+        try:
+            diarized, used_backend = run_diarization(
+                video_path,
+                work,
+                model=args.diarize_model,
+                num_speakers=args.num_speakers,
+                min_speakers=args.min_speakers,
+                max_speakers=args.max_speakers,
+                threshold=args.diar_threshold,
+                start_seconds=start_sec,
+                end_seconds=end_sec,
+            )
+            transcript_segments = diarized
+            transcript_text = format_diarized_transcript(diarized)
+            transcript_source = f"diarization ({used_backend})"
+        except SystemExit as exc:
+            print(
+                f"[watch] diarization failed: {exc}; falling back to normal transcription",
+                file=sys.stderr,
+            )
+
     if not transcript_segments and dl.get("subtitle_path"):
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
@@ -237,35 +301,51 @@ def main() -> int:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
     if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
-        backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+        backends = transcription_backends(args.whisper)
+        failures = []
+        for backend, api_key in backends:
             try:
-                all_segments, used_backend = transcribe_video(
+                transcript_segments, used_backend = transcribe_video(
                     video_path,
                     work / "audio.mp3",
                     backend=backend,
                     api_key=api_key,
+                    model_size=args.diarize_model,
+                    start_seconds=start_sec,
+                    end_seconds=end_sec,
                 )
-                transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
                 transcript_source = f"whisper ({used_backend})"
+                break
             except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
-        else:
+                failures.append(f"{backend}: {exc}")
+                print(
+                    f"[watch] {backend} transcription failed: {exc}",
+                    file=sys.stderr,
+                )
+        if not transcript_segments:
             hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
+                f"--whisper {args.whisper} was set but that backend is unavailable"
                 if args.whisper else
-                "no subtitles and no Whisper API key found"
+                "no usable local or cloud transcription backend was found"
             )
             setup_py = SCRIPT_DIR / "setup.py"
             print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                f"[watch] {hint}; run `python {setup_py}` for setup guidance",
                 file=sys.stderr,
             )
     elif not transcript_segments and video_path and not meta.get("has_audio"):
-        print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+        print("[watch] no audio stream found; proceeding without transcription", file=sys.stderr)
 
     info = dl.get("info") or {}
+
+    report_handle = None
+    original_stdout = sys.stdout
+    if args.report_file:
+        report_path = Path(args.report_file).expanduser().resolve()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_handle = report_path.open("w", encoding="utf-8", newline="\n")
+        sys.stdout = report_handle
 
     print()
     print("# watch: video report")
@@ -278,7 +358,7 @@ def main() -> int:
     print(f"- **Duration:** {format_time(full_duration)} ({full_duration:.1f}s)")
     if focused:
         print(
-            f"- **Focus range:** {format_time(effective_start)} → {format_time(effective_end)} "
+            f"- **Focus range:** {format_time(effective_start)} to {format_time(effective_end)} "
             f"({effective_duration:.1f}s)"
         )
     if meta.get("width") and meta.get("height"):
@@ -328,7 +408,7 @@ def main() -> int:
         print()
         print(
             f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
-            f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
+            f"under `{detail}` detail; its cap spreads thin across the full clip. For better results, "
             "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
             "`--detail token-burner` to keep every scene-change frame across the whole video."
         )
@@ -340,8 +420,9 @@ def main() -> int:
         print(f"Frames live at: `{work / 'frames'}`")
         print()
         print(
-            "**Read each frame path below with the Read tool to view the image.** "
-            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
+            "**Open each frame path with the host's available image-viewing tool.** "
+            "If the host cannot open local frames, continue transcript-only and report that limitation. "
+            "Frames are chronological; `t=MM:SS` is the absolute source timestamp."
         )
         print()
         for frame in frames:
@@ -358,7 +439,7 @@ def main() -> int:
     if transcript_text:
         label = transcript_source or "captions"
         if focused:
-            print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
+            print(f"_Source: {label}. Filtered to {format_time(effective_start)} to {format_time(effective_end)}:_")
         else:
             print(f"_Source: {label}._")
         print()
@@ -372,19 +453,24 @@ def main() -> int:
             "`--detail balanced` for frames._"
         )
     elif focused and dl.get("subtitle_path"):
-        print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
+        print(f"_No transcript lines fell inside {format_time(effective_start)} to {format_time(effective_end)}._")
     else:
         setup_py = SCRIPT_DIR / "setup.py"
         print(
-            "_No transcript available — proceed with frames only. "
+            "_No transcript available; proceed with frames only. "
             "Captions were missing and the Whisper fallback was unavailable "
-            "(no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            "(no backend configured, or `--no-whisper` was used). "
+            f"Run `python {setup_py}` to enable transcription, then re-run._"
         )
 
     print()
     print("---")
-    print(f"_Work dir: `{work}` — delete when done._")
+    print(f"_Work dir: `{work}`; delete when done._")
+
+    if report_handle is not None:
+        report_handle.close()
+        sys.stdout = original_stdout
+        print(f"[watch] report written: {report_path}", file=sys.stderr)
 
     return 0
 

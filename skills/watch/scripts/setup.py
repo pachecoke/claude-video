@@ -30,6 +30,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from config import get_config  # noqa: E402
+from diarization import diarization_available  # noqa: E402
+from whisper import local_whisper_available  # noqa: E402
 
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
@@ -37,20 +39,28 @@ CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
 ENV_TEMPLATE = """# /watch API configuration
 #
-# Whisper transcription fallback — used only when yt-dlp cannot get captions
+# Whisper transcription fallback - used only when yt-dlp cannot get captions
 # (or when you point /watch at a local file with no subtitles).
 #
-# Groq is preferred: it runs whisper-large-v3 at a fraction of OpenAI's price
-# and is faster in practice. OpenAI is the compatible fallback.
+# Local faster-whisper is preferred when installed. Groq and OpenAI are
+# compatible cloud fallbacks.
 #
 # Get a Groq key:  https://console.groq.com/keys
 # Get an OpenAI key:  https://platform.openai.com/api-keys
 #
-# Leave both blank to disable Whisper — /watch will still work, but videos
+# Leave both blank to disable cloud Whisper. /watch will still work, but videos
 # without native captions will come back frames-only.
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
+
+# Optional local diarization and certificate settings. Keep secrets only here
+# or in the process environment. Never put real values in the repository.
+HF_TOKEN=
+WATCH_CA_BUNDLE=
+WATCH_DIARIZE_PYTHON=
+WATCH_DIARIZE_SCRIPT=
+PYANNOTE_MODEL=pyannote/speaker-diarization-community-1
 
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
@@ -73,6 +83,8 @@ _PERM_WARNED: set[str] = set()
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr (once per path per process) if a secrets file is
     world/group readable."""
+    if platform.system() == "Windows":
+        return
     key = str(path)
     if key in _PERM_WARNED:
         return
@@ -119,6 +131,12 @@ def _have_api_key() -> tuple[bool, str | None]:
     if _read_env_key("OPENAI_API_KEY"):
         return True, "openai"
     return False, None
+
+
+def _have_transcription_backend() -> tuple[bool, str | None, bool]:
+    local = local_whisper_available()
+    has_key, cloud = _have_api_key()
+    return local or has_key, ("faster-whisper" if local else cloud), has_key
 
 
 def is_first_run() -> bool:
@@ -217,29 +235,24 @@ def _install_hint_windows(missing: list[str]) -> str:
 def _status() -> dict:
     """Structured preflight snapshot.
 
-    `status` describes the *ideal* state (a Whisper key is encouraged), so a
-    keyless install still reports `needs_key` on the very first run — that's
-    the agent's cue to encourage adding one.
-
-    `can_proceed` is the operational gate: /watch can run as long as the
-    binaries are present AND the user has either set a key or already finished
-    setup (consciously opting out of Whisper). A keyless user who completed
-    setup is NOT nagged on every call.
+    Existing JSON fields remain stable. Additional fields describe the local
+    keyless backend and optional diarization readiness.
     """
     missing = _check_binaries()
-    has_key, backend = _have_api_key()
+    has_backend, backend, has_key = _have_transcription_backend()
+    has_local = backend == "faster-whisper"
     setup_complete = not is_first_run()
 
-    if not missing and has_key:
+    if not missing and has_backend:
         status = "ready"
-    elif missing and not has_key:
+    elif missing and not has_backend:
         status = "needs_install_and_key"
     elif missing:
         status = "needs_install"
     else:
         status = "needs_key"
 
-    can_proceed = (not missing) and (has_key or setup_complete)
+    can_proceed = (not missing) and (has_backend or setup_complete)
 
     cfg = get_config()
     return {
@@ -250,6 +263,9 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "has_local_whisper": has_local,
+        "has_transcription_backend": has_backend,
+        "diarization_available": diarization_available(),
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
@@ -275,16 +291,16 @@ def cmd_check() -> int:
     parts = []
     if s["missing_binaries"]:
         parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
-    if not s["has_api_key"] and not s["setup_complete"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+    if not s["has_transcription_backend"] and not s["setup_complete"]:
+        parts.append("no transcription backend")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
-        f"Run: python3 {installer}\n"
+        f"Run: python {installer}\n"
     )
     sys.stderr.flush()
 
-    if s["missing_binaries"] and not s["has_api_key"]:
+    if s["missing_binaries"] and not s["has_transcription_backend"]:
         return 4
     if s["missing_binaries"]:
         return 2
@@ -313,11 +329,11 @@ def cmd_install() -> int:
                 return 2
             installed_deps = True
         elif system == "Linux":
-            print("[setup] dependencies missing on Linux — please install:", file=sys.stderr)
+            print("[setup] dependencies missing on Linux; please install:", file=sys.stderr)
             print("  " + _install_hint_linux(missing), file=sys.stderr)
             return 2
         elif system == "Windows":
-            print("[setup] dependencies missing on Windows — please install:", file=sys.stderr)
+            print("[setup] dependencies missing on Windows; please install:", file=sys.stderr)
             print("  " + _install_hint_windows(missing), file=sys.stderr)
             return 2
         else:
@@ -331,22 +347,28 @@ def cmd_install() -> int:
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
 
-    has_key, backend = _have_api_key()
-    if has_key:
+    has_backend, backend, _has_key = _have_transcription_backend()
+    if has_backend:
         _write_setup_complete()
         print(f"[setup] ready. whisper backend: {backend}")
+        if diarization_available():
+            print("[setup] optional WhisperX diarization is available.")
         if installed_deps:
             print("[setup] installed dependencies; /watch is fully set up.")
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] add a local or cloud transcription backend.")
     print("")
     print(f"  Edit {CONFIG_FILE} and set either:")
-    print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
+    print("    GROQ_API_KEY=...    (cloud; get one at console.groq.com/keys)")
     print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
     print("")
-    print("  Without a key, /watch still works but videos without captions come back frames-only.")
+    print("  Or install faster-whisper from requirements-local.txt for private local transcription.")
+    print("  Optional diarization uses requirements-diarize.txt and gated model terms at:")
+    print("    https://huggingface.co/pyannote/speaker-diarization-community-1")
+    print("")
+    print("  Without a backend, videos without captions come back frames-only.")
     return 3
 
 

@@ -2,6 +2,30 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.0] - 2026-07-29
+
+### Added
+
+- Private faster-whisper `1.2.1` transcription, preferred before cloud backends.
+- Optional WhisperX `3.8.6` and pyannote.audio `4.0.7` speaker diarization.
+- Exact, minimum, and maximum speaker controls plus clustering threshold.
+- UTF-8 `--report-file` output for durable long transcripts.
+- Personal Codex marketplace compatibility under the qualified `watch` name.
+
+### Changed
+
+- Focus ranges extract only the requested audio and restore absolute timestamps.
+- Runtime output is ASCII-safe for Windows CP1252 consoles.
+- Frame viewing instructions are host-neutral with transcript-only fallback.
+- Fork metadata preserves the original author and MIT attribution.
+
+### Security
+
+- Hugging Face tokens are read only from process state or the private watch config.
+- Certificate overrides are scoped to model initialization.
+- Secrets, reports, models, and virtual environments are excluded from Git.
+
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

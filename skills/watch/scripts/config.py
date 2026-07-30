@@ -14,6 +14,15 @@ DEFAULT_DETAIL = "balanced"
 DETAILS = {"transcript", "efficient", "balanced", "token-burner"}
 
 
+def config_value(name: str, default: str | None = None) -> str | None:
+    """Read one setting from the process environment or the private config file."""
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    value = read_env_file().get(name)
+    return value.strip() if value and value.strip() else default
+
+
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     if path is None:
         path = CONFIG_FILE
@@ -46,13 +55,7 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
 
 
 def get_config() -> dict[str, object]:
-    file_values = read_env_file()
-
-    detail = (
-        os.environ.get("WATCH_DETAIL")
-        or file_values.get("WATCH_DETAIL")
-        or DEFAULT_DETAIL
-    )
+    detail = config_value("WATCH_DETAIL", DEFAULT_DETAIL)
     if detail not in DETAILS:
         detail = DEFAULT_DETAIL
 

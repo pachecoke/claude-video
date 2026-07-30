@@ -14,3 +14,29 @@ htmlcov/
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# secrets and certificates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+
+# local models, environments, caches, and generated reports
+whisperx-env/
+venv/
+env/
+.cache/
+models/
+model-cache/
+*.report.md
+watch-report*.md
+*.transcript.md
+*.srt
+*.vtt
+*.wav
+*.mp3

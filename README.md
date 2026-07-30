@@ -1,16 +1,19 @@
 # /watch
 
+This fork preserves Bradley Bonanno's original MIT-licensed watch identity and adds private local transcription, speaker diarization, Windows portability, and Codex marketplace support.
+
+
 **Give Claude the ability to watch any video.**
 
 Claude Code (recommended — auto-updates via marketplace):
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add pachecoke/claude-video
 /plugin install watch@claude-video
 ```
 
 Codex, Cursor, Copilot, Gemini CLI, or any of 50+ [Agent Skills](https://agentskills.io) hosts:
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add pachecoke/claude-video -g
 ```
 (`-g` installs globally for your user, available across all projects. Drop it to scope per-project.)
 
@@ -99,15 +102,15 @@ End-to-end from a cold URL, `transcript` is the cheapest mode by far; the frame 
 
 | Surface | Install |
 |---------|---------|
-| **Claude Code** | `/plugin marketplace add bradautomates/claude-video` then `/plugin install watch@claude-video` |
-| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add bradautomates/claude-video -g` |
-| **claude.ai** (web) | [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
+| **Claude Code** | `/plugin marketplace add pachecoke/claude-video` then `/plugin install watch@claude-video` |
+| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add pachecoke/claude-video -g` |
+| **claude.ai** (web) | [Download `watch.skill`](https://github.com/pachecoke/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
 | **Manual / dev** | `git clone` then symlink `skills/watch` into your host's skills dir (see below) |
 
 ### Claude Code
 
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add pachecoke/claude-video
 /plugin install watch@claude-video
 ```
 
@@ -118,7 +121,7 @@ Update later with `/plugin update watch@claude-video`.
 The [Agent Skills](https://agentskills.io) CLI installs the skill into whatever agents it detects:
 
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add pachecoke/claude-video -g
 ```
 
 `-g` installs globally for your user (`~/.codex/skills`, `~/.cursor/skills`, etc.); drop it to install into the current project instead. Useful flags:
@@ -133,7 +136,7 @@ Update later with `npx skills update watch -g`.
 
 ### claude.ai (web)
 
-1. [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) from the latest release.
+1. [Download `watch.skill`](https://github.com/pachecoke/claude-video/releases/latest) from the latest release.
 2. Go to Settings → Capabilities → Skills.
 3. Click `+` and drop the file in.
 
@@ -144,7 +147,7 @@ Enable "Code execution and file creation" under Capabilities first — the skill
 Clone the repo and symlink the self-contained skill folder into your host's skills directory — the symlink keeps the install in sync with your working tree as you edit:
 
 ```bash
-git clone https://github.com/bradautomates/claude-video.git
+git clone https://github.com/pachecoke/claude-video.git
 ln -s "$(pwd)/claude-video/skills/watch" ~/.claude/skills/watch   # or ~/.codex/skills/watch
 ```
 
@@ -172,6 +175,37 @@ Captions cover the majority of public videos for free. The Whisper fallback only
 | Whisper fallback (alt) | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
 
+## Private local transcription and speaker diarization
+
+Local faster-whisper is preferred when installed, followed by Groq and
+OpenAI. Install the verified lightweight baseline with:
+
+```bash
+python -m pip install -r skills/watch/requirements-local.txt
+```
+
+Speaker diarization is optional and runs in an isolated WhisperX environment.
+Install the appropriate PyTorch and Torchaudio build separately, then install:
+
+```bash
+python -m pip install -r skills/watch/requirements-diarize.txt
+```
+
+Verified GPU baseline: PyTorch `2.8.0+cu128`, Torchaudio `2.8.0+cu128`,
+WhisperX `3.8.6`, and pyannote.audio `4.0.7`. The plugin does not create GPU
+environments or download models automatically.
+
+Set `WATCH_DIARIZE_PYTHON` when the environment is not under
+`~/whisperx-env`. Put `HF_TOKEN` only in the process environment or
+`~/.config/watch/.env`, and accept the gated model terms for
+`pyannote/speaker-diarization-community-1`. `WATCH_CA_BUNDLE` can identify a
+corporate CA bundle. Credentials, certificates, models, and virtual
+environments are ignored by Git and are never written into reports.
+
+Use `--diarize --num-speakers 2 --report-file report.md` for a durable
+two-speaker transcript. Focus ranges process only the requested audio and
+retain absolute source timestamps.
+
 ## Usage
 
 ```
@@ -195,8 +229,8 @@ Other knobs (passed to `scripts/watch.py`):
 - `--max-frames N` — lower the frame cap for a tighter token budget.
 - `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
 - `--fps F` — override the auto-fps calculation (still capped at 2 fps).
-- `--whisper groq|openai` — force a specific Whisper backend.
-- `--no-whisper` — disable transcription entirely; frames only.
+- `--whisper faster-whisper|groq|openai` - force a transcription backend.
+- `--diarize` - run local WhisperX speaker diarization.`n- `--num-speakers N`, `--min-speakers N`, `--max-speakers N` - guide speaker detection.`n- `--report-file PATH` - write the complete UTF-8 Markdown report.`n- `--no-whisper` - disable transcription entirely; frames only.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
 - `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
 
@@ -255,12 +289,12 @@ Built by Brad Bonanno — I make content about building with AI on [YouTube (@br
 
 <a href="https://www.star-history.com/?repos=bradautomates%2Fclaude-video&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=pachecoke/claude-video&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=pachecoke/claude-video&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=pachecoke/claude-video&type=date&legend=top-left" />
  </picture>
 </a>
 
 ---
 
-[github.com/bradautomates/claude-video](https://github.com/bradautomates/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)
+[github.com/pachecoke/claude-video](https://github.com/pachecoke/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)

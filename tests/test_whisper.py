@@ -67,6 +67,13 @@ class TestShiftSegments:
         whisper.shift_segments(segs, 10.0)
         assert segs[0]["start"] == 0.0
 
+    def test_preserves_speaker_label(self):
+        segs = [{"start": 1.0, "end": 2.0, "text": "x", "speaker": "Speaker 1"}]
+        assert whisper.shift_segments(segs, 30.0) == [
+            {"start": 31.0, "end": 32.0, "text": "x", "speaker": "Speaker 1"}
+        ]
+
+
 
 def _make_mp3(path: Path, seconds: float) -> None:
     """Synthesize a mono 16k 64k mp3 of a sine tone — mirrors extract_audio's format."""
@@ -155,3 +162,77 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+class TestBackendSelection:
+    def test_local_precedes_cloud(self, monkeypatch):
+        monkeypatch.setattr(whisper, "local_whisper_available", lambda: True)
+        monkeypatch.setattr(
+            whisper,
+            "load_api_key",
+            lambda preferred=None: (preferred, f"{preferred}-key"),
+        )
+        assert whisper.transcription_backends() == [
+            ("faster-whisper", None),
+            ("groq", "groq-key"),
+            ("openai", "openai-key"),
+        ]
+
+    def test_explicit_cloud_selection(self, monkeypatch):
+        monkeypatch.setattr(whisper, "local_whisper_available", lambda: True)
+        monkeypatch.setattr(
+            whisper,
+            "load_api_key",
+            lambda preferred=None: ("openai", "cloud-key"),
+        )
+        assert whisper.transcription_backends("openai") == [
+            ("openai", "cloud-key")
+        ]
+
+    def test_no_backend(self, monkeypatch):
+        monkeypatch.setattr(whisper, "local_whisper_available", lambda: False)
+        monkeypatch.setattr(whisper, "load_api_key", lambda preferred=None: (None, None))
+        assert whisper.transcription_backends() == []
+
+
+def test_extract_audio_limits_focus_range(monkeypatch, tmp_path):
+    output = tmp_path / "focused.mp3"
+    captured = {}
+
+    monkeypatch.setattr(whisper.shutil, "which", lambda name: name)
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        output.write_bytes(b"audio")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(whisper.subprocess, "run", fake_run)
+    whisper.extract_audio("video.mp4", output, 30.0, 45.0)
+    assert captured["command"][captured["command"].index("-ss") + 1] == "30.000"
+    assert captured["command"][captured["command"].index("-t") + 1] == "15.000"
+
+
+def test_transcribe_video_shifts_focused_timestamps(monkeypatch, tmp_path):
+    audio = tmp_path / "audio.mp3"
+
+    def fake_extract(_video, out, _start, _end):
+        out.write_bytes(b"audio")
+        return out
+
+    monkeypatch.setattr(whisper, "extract_audio", fake_extract)
+    monkeypatch.setattr(
+        whisper,
+        "_transcribe_file",
+        lambda backend, key, path, model: [
+            {"start": 1.0, "end": 2.0, "text": "focused"}
+        ],
+    )
+    segments, backend = whisper.transcribe_video(
+        "video.mp4",
+        audio,
+        backend="faster-whisper",
+        start_seconds=120.0,
+        end_seconds=140.0,
+    )
+    assert backend == "faster-whisper"
+    assert segments[0]["start"] == 121.0

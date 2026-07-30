@@ -1,0 +1,5 @@
+# Optional WhisperX diarization environment.
+# Install torch and torchaudio separately for the intended CPU or CUDA target.
+# Verified CUDA baseline: torch==2.8.0+cu128, torchaudio==2.8.0+cu128.
+whisperx==3.8.6
+pyannote.audio==4.0.7

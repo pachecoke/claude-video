@@ -31,3 +31,17 @@ V2_CONCERNS.md
 
 # Dev-only script shipped inside the skill tree but not needed at runtime
 skills/watch/scripts/build-skill.sh
+
+# Never package local secrets, trust stores, models, or environments
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+whisperx-env/
+models/
+model-cache/

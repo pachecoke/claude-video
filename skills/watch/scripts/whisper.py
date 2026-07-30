@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Transcribe a video via Groq or OpenAI Whisper API.
+"""Transcribe video with local faster-whisper, Groq, or OpenAI.
 
-Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
-API has a key. Returns segments in the same shape as transcribe.parse_vtt so
-the rest of the pipeline (filter_range, format_transcript) doesn't care where
-the transcript came from.
+Local faster-whisper is preferred when installed. Cloud backends remain
+available as fallbacks. Every backend receives an extracted audio file, and
+focused processing extracts only the requested source range.
 
-Pure stdlib — no `pip install groq` or `pip install openai` needed.
+The cloud clients use only the standard library. Local transcription is an
+optional dependency documented in requirements-local.txt.
 """
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from config import config_value  # noqa: E402
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"
@@ -62,10 +67,21 @@ def plan_chunks(
     return plan
 
 
-def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
-    """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
+def local_whisper_available() -> bool:
+    """Return whether faster-whisper can be used by this interpreter."""
+    if os.environ.get("WATCH_DISABLE_LOCAL_WHISPER", "").lower() in ("1", "true", "yes"):
+        return False
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
-    If `preferred` is "groq" or "openai", only that backend's key is considered.
+
+def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
+    """Return a cloud (backend, api_key), preferring Groq over OpenAI.
+
+    faster-whisper is keyless and is intentionally handled separately.
     """
     def _from_env(name: str) -> str | None:
         value = os.environ.get(name)
@@ -112,10 +128,33 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     return None, None
 
 
-def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+def transcription_backends(preferred: str | None = None) -> list[tuple[str, str | None]]:
+    """Return usable backends in execution order without exposing credentials."""
+    if preferred:
+        if preferred == "faster-whisper":
+            return [(preferred, None)] if local_whisper_available() else []
+        backend, key = load_api_key(preferred)
+        return [(backend, key)] if backend and key else []
+
+    backends: list[tuple[str, str | None]] = []
+    if local_whisper_available():
+        backends.append(("faster-whisper", None))
+    for name in ("groq", "openai"):
+        backend, key = load_api_key(name)
+        if backend and key:
+            backends.append((backend, key))
+    return backends
+
+
+def extract_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> Path:
+    """Extract mono 16 kHz audio, optionally limited to a source time range."""
     if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+        raise SystemExit("ffmpeg is not installed")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -124,18 +163,25 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-loglevel", "error",
         "-y",
         "-i", str(Path(video_path).resolve()),
+    ]
+    if start_seconds is not None:
+        cmd.extend(["-ss", f"{start_seconds:.3f}"])
+    if end_seconds is not None:
+        start = start_seconds or 0.0
+        cmd.extend(["-t", f"{max(0.0, end_seconds - start):.3f}"])
+    cmd.extend([
         "-vn",
         "-acodec", "libmp3lame",
         "-ar", "16000",
         "-ac", "1",
         "-b:a", "64k",
         str(out_path.resolve()),
-    ]
+    ])
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg audio extraction failed: {result.stderr.strip()}")
     if not out_path.exists() or out_path.stat().st_size == 0:
-        raise SystemExit("ffmpeg produced no audio — video may have no audio track")
+        raise SystemExit("ffmpeg produced no audio; the video may have no audio track")
     return out_path
 
 
@@ -278,7 +324,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
 
             if attempt < MAX_ATTEMPTS - 1:
                 print(
-                    f"[watch] whisper HTTP {exc.code} — retrying in {delay:.1f}s "
+                    f"[watch] whisper HTTP {exc.code}; retrying in {delay:.1f}s "
                     f"(attempt {attempt + 2}/{MAX_ATTEMPTS})",
                     file=sys.stderr,
                 )
@@ -289,7 +335,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_BASE_DELAY * (attempt + 1)
                 print(
-                    f"[watch] whisper network error ({type(exc).__name__}: {exc}) — "
+                    f"[watch] whisper network error ({type(exc).__name__}: {exc}); "
                     f"retrying in {delay:.1f}s (attempt {attempt + 2}/{MAX_ATTEMPTS})",
                     file=sys.stderr,
                 )
@@ -314,7 +360,7 @@ def _read_error_body(exc: urllib.error.HTTPError) -> str:
     if not body:
         return ""
     try:
-        return f" — {body.decode('utf-8', errors='replace')[:400]}"
+        return f" - {body.decode('utf-8', errors='replace')[:400]}"
     except Exception:
         return ""
 
@@ -337,14 +383,17 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
     """
     if offset_seconds == 0:
         return segments
-    return [
-        {
+    shifted = []
+    for seg in segments:
+        item = {
             "start": round(seg["start"] + offset_seconds, 2),
             "end": round(seg["end"] + offset_seconds, 2),
             "text": seg["text"],
         }
-        for seg in segments
-    ]
+        if "speaker" in seg:
+            item["speaker"] = seg["speaker"]
+        shifted.append(item)
+    return shifted
 
 
 def _segments_from_response(data: dict) -> list[dict]:
@@ -385,13 +434,13 @@ def transcribe_chunks(
         except SystemExit as exc:
             failures += 1
             print(
-                f"[watch] chunk {index + 1}/{len(chunks)} failed — skipping ({exc})",
+                f"[watch] chunk {index + 1}/{len(chunks)} failed; skipping ({exc})",
                 file=sys.stderr,
             )
             continue
         segments.extend(shift_segments(chunk_segments, offset))
         print(
-            f"[watch] chunk {index + 1}/{len(chunks)} → {len(chunk_segments)} segments",
+            f"[watch] chunk {index + 1}/{len(chunks)} -> {len(chunk_segments)} segments",
             file=sys.stderr,
         )
 
@@ -400,14 +449,74 @@ def transcribe_chunks(
     return segments
 
 
-def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]:
+def _certificate_bundle() -> str | None:
+    configured = config_value("WATCH_CA_BUNDLE")
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"WATCH_CA_BUNDLE does not exist: {path}")
+        return str(path.resolve())
+    try:
+        import certifi
+        return certifi.where()
+    except ImportError:
+        return None
+
+
+def _transcribe_local(audio_path: Path, model_size: str) -> list[dict]:
+    try:
+        import faster_whisper
+    except ImportError:
+        raise SystemExit(
+            "faster-whisper is not installed; see requirements-local.txt"
+        )
+
+    bundle = _certificate_bundle()
+    original_client = None
+    try:
+        if bundle:
+            try:
+                import httpx
+                original_client = httpx.Client.__init__
+
+                def patched_client(self, *args, **kwargs):
+                    kwargs.setdefault("verify", bundle)
+                    original_client(self, *args, **kwargs)
+
+                httpx.Client.__init__ = patched_client
+            except ImportError:
+                pass
+        model = faster_whisper.WhisperModel(
+            model_size,
+            device="auto",
+            compute_type="auto",
+        )
+    finally:
+        if original_client is not None:
+            httpx.Client.__init__ = original_client
+
+    raw_segments, _info = model.transcribe(str(audio_path.resolve()))
+    return [
+        {
+            "start": round(float(segment.start), 2),
+            "end": round(float(segment.end), 2),
+            "text": segment.text.strip(),
+        }
+        for segment in raw_segments
+        if segment.text.strip()
+    ]
+
+
+def _transcribe_file(backend: str, api_key: str | None, audio_path: Path, model_size: str) -> list[dict]:
     """Upload one audio file and return its 0-based segments."""
-    if backend == "groq":
+    if backend == "faster-whisper":
+        return _transcribe_local(audio_path, model_size)
+    if backend == "groq" and api_key:
         response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-    elif backend == "openai":
+    elif backend == "openai" and api_key:
         response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
     else:
-        raise SystemExit(f"Unknown whisper backend: {backend}")
+        raise SystemExit(f"Whisper backend is unavailable: {backend}")
     return _segments_from_response(response)
 
 
@@ -416,34 +525,40 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    model_size: str = "large-v3",
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    """Extract the requested audio range, transcribe it, and restore source time.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
     """
-    if backend is None or api_key is None:
-        detected_backend, detected_key = load_api_key()
-        backend = backend or detected_backend
-        api_key = api_key or detected_key
+    if backend is None:
+        detected = transcription_backends()
+        if detected:
+            backend, api_key = detected[0]
+    elif backend != "faster-whisper" and api_key is None:
+        _detected_backend, api_key = load_api_key(backend)
 
-    if not backend or not api_key:
+    if not backend or (backend != "faster-whisper" and not api_key):
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
-            f"Run `python3 {setup_py}` to configure."
+            "No transcription backend is available. Install faster-whisper or configure "
+            "GROQ_API_KEY or OPENAI_API_KEY in ~/.config/watch/.env. "
+            f"Run `python {setup_py}` for status."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
+    print(f"[watch] extracting audio for Whisper ({backend})...", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out, start_seconds, end_seconds)
     audio_bytes = audio_path.stat().st_size
+    timeline_offset = start_seconds or 0.0
 
     def transcribe_one(path: Path) -> list[dict]:
-        return _transcribe_file(backend, api_key, path)
+        return _transcribe_file(backend, api_key, path, model_size)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    if backend == "faster-whisper" or audio_bytes <= MAX_UPLOAD_BYTES:
         print(
-            f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
+            f"[watch] audio: {audio_bytes / 1024:.0f} kB; transcribing with {backend}...",
             file=sys.stderr,
         )
         segments = transcribe_one(audio_path)
@@ -452,12 +567,13 @@ def transcribe_video(
         plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
         print(
             f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB; splitting into {len(plan)} chunks...",
             file=sys.stderr,
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
         segments = transcribe_chunks(chunks, transcribe_one)
 
+    segments = shift_segments(segments, timeline_offset)
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")
 
@@ -467,7 +583,7 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend faster-whisper|groq|openai]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]

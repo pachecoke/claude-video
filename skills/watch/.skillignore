@@ -1,3 +1,16 @@
 # Scans that start from this skill directory (not the repo root).
 # Keep non-runtime packaging/dev artifacts out of install-time security scans.
 scripts/build-skill.sh
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+__pycache__/
+*.pyc
+models/
+model-cache/
