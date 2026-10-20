@@ -23,6 +23,7 @@ from download import download, fetch_captions, is_url, auth_args  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps, validate_controls  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+import diarization  # noqa: E402
 from runtime import configure_stdio  # noqa: E402
 
 
@@ -33,7 +34,8 @@ LOCAL_ONLY_FLAGS = (("--detail", "detail"), ("--fps", "fps"), ("--max-frames", "
 def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
     """Google watches the video. No captions, frames, or Whisper; no fallback on failure."""
     ignored = [flag for flag, name in LOCAL_ONLY_FLAGS if getattr(args, name) is not None]
-    ignored += [flag for flag, on in (("--no-whisper", args.no_whisper), ("--no-dedup", args.no_dedup)) if on]
+    ignored += [flag for flag, on in (("--no-whisper", args.no_whisper), ("--no-dedup", args.no_dedup),
+                                      ("--diarize", args.diarize)) if on]
     clip = (start_sec, end_sec) if start_sec is not None or end_sec is not None else None
     uploaded, warning, result, error, sent, work = None, None, None, None, "URL sent to Google", None
     try:
@@ -135,6 +137,14 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--diarize",
+        action="store_true",
+        help="Label speakers in the transcript (local WhisperX + pyannote, runs in the managed "
+             "WhisperX venv). Opt-in and local-only: needs setup.py --install-whisperx with "
+             "WATCH_WHISPERX_DIARIZE=true and an HF_TOKEN for the gated pyannote model. "
+             "Set WATCH_WHISPERX_DEVICE=cuda for GPU.",
+    )
     ap.add_argument("--sub-lang", default=None, help="Exact caption language preference (default auto/native)")
     cookies = ap.add_mutually_exclusive_group()
     cookies.add_argument("--cookies", default=None, help="Explicit cookie file (yt-dlp may update this jar)")
@@ -147,6 +157,10 @@ def main() -> int:
     args = ap.parse_args()
     if args.no_whisper and args.whisper:
         ap.error("--no-whisper conflicts with --whisper")
+    if args.diarize and args.no_whisper:
+        ap.error("--diarize needs local transcription and conflicts with --no-whisper")
+    if args.diarize and args.whisper in ("groq", "openai"):
+        ap.error("--diarize is local-only (WhisperX + pyannote); it conflicts with --whisper groq/openai")
 
     config = get_config(backend_override="none" if args.no_whisper else args.whisper)
     detail = args.detail or config["detail"]
@@ -196,7 +210,7 @@ def main() -> int:
 
     audio_only = detail == "transcript" and not cue_timestamps
     # Captions are assessed before range filtering: a quiet interval is not a missing track.
-    need_media = not (audio_only and (track_available or backend_choice == "none") and url_source)
+    need_media = args.diarize or not (audio_only and (track_available or backend_choice == "none") and url_source)
     if need_media:
         try:
             print("[watch] downloading media…" if url_source else "[watch] using local file…", file=sys.stderr)
@@ -264,7 +278,42 @@ def main() -> int:
         frames = merge_frames(frames, cue_frames)
 
     transcript_state = "missing"
-    if not track_available and backend_choice != "none" and video_path and meta.get("has_audio"):
+    diarized = False
+    if args.diarize:
+        if not video_path or not meta.get("has_audio"):
+            transcript_state = "diarization unavailable: no local audio stream"
+            if video_path:
+                errors.append("Diarization needs a local audio stream; none was available.")
+        else:
+            try:
+                def _int(value):
+                    return int(value) if str(value).strip() else None
+                def _float(value):
+                    return float(value) if str(value).strip() else None
+                all_segments, _ = diarization.run_diarization(
+                    video_path, work,
+                    model=config["whisperx_model"],
+                    device=config["whisperx_device"],
+                    compute_type=config["whisperx_compute_type"],
+                    diarize_model=config["whisperx_diarize_model"],
+                    num_speakers=_int(config["whisperx_num_speakers"]),
+                    min_speakers=_int(config["whisperx_min_speakers"]),
+                    max_speakers=_int(config["whisperx_max_speakers"]),
+                    threshold=_float(config["whisperx_diarize_threshold"]),
+                    start_seconds=start_sec,
+                    end_seconds=effective_end or end_sec,
+                )
+                track_available = bool(all_segments)
+                diarized = True
+                speakers = len({seg["speaker"] for seg in all_segments})
+                device_note = "GPU" if config["whisperx_device"] == "cuda" else "CPU"
+                transcript_source = (f"whisper (whisperx {config['whisperx_model']} + pyannote "
+                                     f"diarization, {speakers} speaker(s), {device_note})")
+                transcript_state = "available" if all_segments else "no speech"
+            except SystemExit as exc:
+                transcript_state = "failed"
+                errors.append(f"Diarization failed: {exc}")
+    if not diarized and not track_available and backend_choice != "none" and video_path and meta.get("has_audio") and not args.diarize:
         backend, api_key = ("whisperx", None) if backend_choice == "whisperx" else load_api_key(None if backend_choice == "auto" else backend_choice)
         if backend:
             try:
@@ -287,8 +336,12 @@ def main() -> int:
     elif not track_available and video_path and not meta.get("has_audio"):
         transcript_state = "no audio stream" if not visual_error else "audio metadata unavailable"
 
-    transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
-    transcript_text = format_transcript(transcript_segments)
+    if diarized:
+        transcript_segments = all_segments  # Already extracted to the focus range and shifted.
+        transcript_text = diarization.format_diarized_transcript(transcript_segments)
+    else:
+        transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+        transcript_text = format_transcript(transcript_segments)
     if track_available:
         transcript_state = "available" if transcript_segments else ("no speech in selected range" if focused and all_segments else "no speech")
     for error in errors:

@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 from config import (CONFIG_DIR, CONFIG_FILE, ConfigError, DETAILS, ENGINES, get_config,
-                    load_api_key, load_gemini_key, read_env_file, resolve_engine, write_settings)
+                    load_api_key, load_gemini_key, load_hf_token, read_env_file, resolve_engine, write_settings)
 from runtime import configure_stdio, diagnostic, run_text
 
 REQUIRED_BINARIES = ['ffmpeg', 'ffprobe', 'yt-dlp']
@@ -265,13 +265,19 @@ def _ensure_uv():
 
 def install_whisperx():
     from local_whisperx import settings, transcribe_audio
+    cfg = settings()
+    device_note = ('CUDA wheels (GPU); needs an NVIDIA GPU with recent drivers'
+                   if cfg['whisperx_device'] == 'cuda' else 'CPU wheels')
     print('[setup] Local WhisperX: requires 3 GB free disk, 8 GB RAM, a 64-bit CPU, and network access for setup. '
           'Downloads about 1 GB of packages plus the 464 MB small model. macOS Apple Silicon is verified; '
-          'Intel macOS, Linux, Windows, and CUDA installs are untested.', file=sys.stderr, flush=True)
+          'Intel macOS, Linux, Windows, and CUDA installs are community-tested, not guaranteed. '
+          f"Installing {device_note}." + (' Including pyannote.audio for speaker diarization.'
+                                          if cfg['whisperx_diarize'] else '')
+          + ' To switch device/compute or toggle diarization on an existing install, delete '
+            '~/.cache/watch/whisperx-venv and rerun --install-whisperx.', file=sys.stderr, flush=True)
     if not _which('ffmpeg'):
         raise SystemExit('Install FFmpeg first, then rerun setup.py --install-whisperx.')
-    cfg = settings()
-    # Check the existing config before downloading or modifying an environment.
+    # cfg (validated above) is checked before downloading or modifying an environment.
     _scaffold_env()
     uv = _ensure_uv()
     venv = Path.home() / '.cache' / 'watch' / 'whisperx-venv'
@@ -288,9 +294,18 @@ def install_whisperx():
         venv.parent.mkdir(parents=True, exist_ok=True)
         _install_step([uv, 'venv', str(venv), '--python', '3.12'], 'Create WhisperX Python 3.12 environment')
         if platform.system() in ('Linux', 'Windows'):
+            if cfg['whisperx_device'] == 'cuda':
+                # CUDA 12.8 wheels; verified baseline torch/torchaudio 2.8.0+cu128.
+                torch_index, torch_step = 'https://download.pytorch.org/whl/cu128', 'Install CUDA PyTorch wheels'
+            else:
+                torch_index, torch_step = 'https://download.pytorch.org/whl/cpu', 'Install CPU PyTorch wheels'
             _install_step([uv, 'pip', 'install', '--python', python, 'torch==2.8.0', 'torchaudio==2.8.0',
-                           '--index-url', 'https://download.pytorch.org/whl/cpu'], 'Install CPU PyTorch wheels')
+                           '--index-url', torch_index], torch_step)
         _install_step([uv, 'pip', 'install', '--python', python, f'whisperx=={WHISPERX_VERSION}'], 'Install WhisperX')
+        if cfg['whisperx_diarize']:
+            # pyannote.audio for speaker diarization (default model speaker-diarization-community-1).
+            _install_step([uv, 'pip', 'install', '--python', python, 'pyannote.audio==4.0.7'],
+                          'Install pyannote.audio for diarization')
     # Invalidate before warm-up: an interrupted repair is always safe to rerun.
     sentinel.unlink(missing_ok=True)
     cfg['whisperx_bin'] = str(executable)
@@ -309,6 +324,12 @@ def install_whisperx():
     write_settings({'WATCH_WHISPER_BACKEND': 'whisperx', 'WATCH_WHISPERX_BIN': str(executable),
                     'WATCH_WHISPERX_MODEL': cfg['whisperx_model'], 'SETUP_COMPLETE': 'true'}, CONFIG_FILE)
     print('[setup] WhisperX is ready; packages and both model caches are warmed.', file=sys.stderr)
+    if cfg['whisperx_diarize']:
+        has_token = bool(load_hf_token())
+        print(f"[setup] Diarization (pyannote) installed. Default model: {cfg['whisperx_diarize_model']}. "
+              "Accept its gated terms on Hugging Face and set HF_TOKEN in "
+              f"{CONFIG_FILE}{' (token detected)' if has_token else ' (no HF_TOKEN detected yet)'}. "
+              "The diarization model downloads on the first `--diarize` run.", file=sys.stderr)
     return 0
 
 

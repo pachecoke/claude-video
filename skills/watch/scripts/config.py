@@ -120,6 +120,20 @@ def load_gemini_key() -> str | None:
     return value or None
 
 
+def load_hf_token() -> str | None:
+    """Hugging Face token for gated pyannote diarization models; never logged."""
+    for name in ('HF_TOKEN', 'HUGGINGFACE_TOKEN', 'HUGGING_FACE_HUB_TOKEN'):
+        value = os.environ.get(name, '').strip()
+        if not value:
+            for path in (CONFIG_FILE, Path.cwd() / '.env'):
+                value = read_env_file(path).get(name, '').strip()
+                if value:
+                    break
+        if value:
+            return value
+    return None
+
+
 def resolve_engine(choice: str, has_key: bool) -> str:
     if choice not in ENGINES:
         raise ConfigError('WATCH_ENGINE must be auto, gemini, or local.')
@@ -157,6 +171,15 @@ def get_config(*, backend_override: str | None = None) -> dict:
         'whisperx_batch_size': setting('WATCH_WHISPERX_BATCH_SIZE', '8'),
         'whisperx_language': setting('WATCH_WHISPERX_LANGUAGE'),
         'whisperx_timeout': setting('WATCH_WHISPERX_TIMEOUT'),
+        'whisperx_python': setting('WATCH_WHISPERX_PYTHON'),
+        # Opt-in pyannote speaker diarization (local, runs in the managed WhisperX venv).
+        'whisperx_diarize': setting('WATCH_WHISPERX_DIARIZE').lower() in ('1', 'true', 'yes', 'on'),
+        'whisperx_diarize_model': (setting('WATCH_WHISPERX_DIARIZE_MODEL', 'pyannote/speaker-diarization-community-1')
+                                   or 'pyannote/speaker-diarization-community-1'),
+        'whisperx_min_speakers': setting('WATCH_WHISPERX_MIN_SPEAKERS'),
+        'whisperx_max_speakers': setting('WATCH_WHISPERX_MAX_SPEAKERS'),
+        'whisperx_num_speakers': setting('WATCH_WHISPERX_NUM_SPEAKERS'),
+        'whisperx_diarize_threshold': setting('WATCH_WHISPERX_DIARIZE_THRESHOLD'),
     }
 
 

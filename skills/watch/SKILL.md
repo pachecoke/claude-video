@@ -116,6 +116,7 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<URL-or-local-path>" --question "<the u
 | `--no-dedup` | Preserve near-identical selected frames |
 | `--whisper groq|openai|whisperx` | Select this run's fallback; captions still come first |
 | `--no-whisper` | Disable every speech fallback, including local; conflicts with `--whisper` |
+| `--diarize` | Label speakers (local WhisperX + pyannote); opt-in, local-only, needs the managed install and `HF_TOKEN`. Set `WATCH_WHISPERX_DEVICE=cuda` for GPU. |
 | `--sub-lang CODE` | Select one exact caption language; default `auto` prefers original-language evidence |
 | `--cookies FILE` | Explicit cookie jar; yt-dlp may update it |
 | `--cookies-from-browser BROWSER` | Explicit browser selector, including a profile if supplied; conflicts with `--cookies` |
@@ -145,7 +146,11 @@ Full-track caption availability is checked before focus filtering. A silent focu
 
 `WATCH_WHISPER_BACKEND=auto|groq|openai|whisperx|none` chooses the saved fallback. In `auto`, each provider looks up its key in environment → user config → cwd `.env`, preferring Groq before checking OpenAI. Explicit provider choices never borrow another provider's key.
 
-WhisperX defaults: `WATCH_WHISPERX_MODEL=small`, `WATCH_WHISPERX_DEVICE=cpu`, `WATCH_WHISPERX_COMPUTE_TYPE=int8`, `WATCH_WHISPERX_BATCH_SIZE=8`. No alignment or diarization is run. `WATCH_WHISPERX_LANGUAGE=es` (for example) gives a spoken-language hint; never infer it from `--sub-lang`, which may request a translation. Without a hint, auto-detection is used but reported as unverified because WhisperX 3.8.6 mislabels its JSON language when alignment is disabled.
+WhisperX defaults: `WATCH_WHISPERX_MODEL=small`, `WATCH_WHISPERX_DEVICE=cpu`, `WATCH_WHISPERX_COMPUTE_TYPE=int8`, `WATCH_WHISPERX_BATCH_SIZE=8`. The default fallback runs transcription only: no alignment or diarization. `WATCH_WHISPERX_LANGUAGE=es` (for example) gives a spoken-language hint; never infer it from `--sub-lang`, which may request a translation. Without a hint, auto-detection is used but reported as unverified because WhisperX 3.8.6 mislabels its JSON language when alignment is disabled.
+
+**GPU.** Set `WATCH_WHISPERX_DEVICE=cuda` and `WATCH_WHISPERX_COMPUTE_TYPE=float16` for NVIDIA GPU inference, then run `setup.py --install-whisperx` so the managed venv gets CUDA PyTorch wheels (verified baseline torch/torchaudio 2.8.0+cu128). CPU int8 remains the default. To switch device or compute on an existing install, delete `~/.cache/watch/whisperx-venv` and reinstall.
+
+**Speaker diarization (`--diarize`).** An opt-in local path that runs WhisperX plus pyannote in the managed venv and labels the transcript by speaker (`[MM:SS] Speaker 1: ...`). It is local-only (no cloud) and replaces the plain transcript for that run. Enable it once with `WATCH_WHISPERX_DIARIZE=true` and `setup.py --install-whisperx` (adds `pyannote.audio`), set `HF_TOKEN` in `~/.config/watch/.env`, and accept the gated model terms on Hugging Face. The gated model (`WATCH_WHISPERX_DIARIZE_MODEL`, default `pyannote/speaker-diarization-community-1`) downloads on the first `--diarize` run. The token is injected into the worker environment, never placed on the command line. Tune with `WATCH_WHISPERX_NUM_SPEAKERS` (exact), or `WATCH_WHISPERX_MIN_SPEAKERS`/`WATCH_WHISPERX_MAX_SPEAKERS` (range), and `WATCH_WHISPERX_DIARIZE_THRESHOLD`. Diarization needs local audio and conflicts with `--no-whisper` and `--whisper groq|openai`.
 
 If a small-model transcript is nonsense, suggest the actual spoken-language hint or `WATCH_WHISPERX_MODEL=large-v3` (2.9 GB model, about 6 GB peak process RAM in the reference measurement), then rerun the installer to warm that model. CPU inference may take minutes. `WATCH_WHISPERX_TIMEOUT` optionally sets positive seconds; by default it has no deadline. CUDA is configurable but untested; do not promise MPS support.
 
