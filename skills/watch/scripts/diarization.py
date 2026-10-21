@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,41 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def _extract_focus_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None,
+    end_seconds: float | None,
+) -> Path:
+    """Extract mono 16 kHz MP3 for diarization.
+
+    0.3.2's whisper.extract_audio() pulls the full track and no longer trims,
+    so when a --start/--end focus range is set we trim here with ffmpeg. The
+    clip is 0-based; run_diarization shifts segment times back by start_seconds.
+    """
+    if start_seconds is None and end_seconds is None:
+        return extract_audio(video_path, out_path)
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if start_seconds is not None:
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    cmd += ["-i", str(Path(video_path).resolve())]
+    if end_seconds is not None:
+        duration = max(0.0, end_seconds - (start_seconds or 0.0))
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += ["-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1",
+            "-b:a", "64k", str(out_path.resolve())]
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise SystemExit(f"ffmpeg audio extraction failed: {result.stderr.strip()}")
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise SystemExit("ffmpeg produced no audio in the requested range")
+    return out_path
+
+
 def run_diarization(
     video_path: str,
     work_dir: Path,
@@ -197,7 +233,7 @@ def run_diarization(
             "~/.config/watch/.env and accept the gated pyannote model terms."
         )
 
-    audio_path = extract_audio(
+    audio_path = _extract_focus_audio(
         video_path,
         work_dir / "diarize-audio.mp3",
         start_seconds,

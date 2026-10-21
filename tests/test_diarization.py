@@ -106,7 +106,7 @@ def test_run_parses_json_extracts_focus_and_shifts(monkeypatch, tmp_path):
     monkeypatch.setattr(diarization, "diarize_script", lambda: script_path)
     monkeypatch.setattr(diarization, "load_hf_token", lambda: "test-token")
 
-    def fake_extract(video, out, start, end):
+    def fake_focus(video, out, start, end):
         captured["range"] = (start, end)
         out.write_bytes(b"audio")
         return out
@@ -123,7 +123,7 @@ def test_run_parses_json_extracts_focus_and_shifts(monkeypatch, tmp_path):
         }
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
-    monkeypatch.setattr(diarization, "extract_audio", fake_extract)
+    monkeypatch.setattr(diarization, "_extract_focus_audio", fake_focus)
     monkeypatch.setattr(diarization.subprocess, "run", fake_run)
     segments, backend = diarization.run_diarization(
         "video.mp4",
@@ -171,7 +171,7 @@ def test_invalid_json_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diarization,
         "extract_audio",
-        lambda video, out, start, end: out,
+        lambda video, out: out,
     )
     monkeypatch.setattr(
         diarization.subprocess,
@@ -180,6 +180,22 @@ def test_invalid_json_is_rejected(monkeypatch, tmp_path):
     )
     with pytest.raises(SystemExit, match="invalid JSON"):
         diarization.run_diarization("video.mp4", tmp_path)
+
+
+def test_focus_audio_no_range_delegates_to_extract_audio(monkeypatch, tmp_path):
+    # Guards the 0.3.2 extract_audio arity: with no focus range it must call
+    # extract_audio with exactly (video, out), not the old 4-arg form.
+    calls = {}
+    out = tmp_path / "a.mp3"
+
+    def fake_extract(video, out_path):
+        calls["args"] = (video, out_path)
+        return out_path
+
+    monkeypatch.setattr(diarization, "extract_audio", fake_extract)
+    result = diarization._extract_focus_audio("video.mp4", out, None, None)
+    assert result == out
+    assert calls["args"] == ("video.mp4", out)
 
 
 def test_wrapper_main_emits_json(monkeypatch, capsys):
