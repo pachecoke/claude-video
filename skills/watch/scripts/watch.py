@@ -28,7 +28,8 @@ from runtime import configure_stdio  # noqa: E402
 
 
 LOCAL_ONLY_FLAGS = (("--detail", "detail"), ("--fps", "fps"), ("--max-frames", "max_frames"),
-                    ("--timestamps", "timestamps"), ("--whisper", "whisper"), ("--sub-lang", "sub_lang"))
+                    ("--timestamps", "timestamps"), ("--whisper", "whisper"), ("--sub-lang", "sub_lang"),
+                    ("--num-speakers", "num_speakers"))
 
 
 def run_gemini(args, config, key, start_sec, end_sec, auth) -> int:
@@ -145,6 +146,13 @@ def main() -> int:
              "WATCH_WHISPERX_DIARIZE=true and an HF_TOKEN for the gated pyannote model. "
              "Set WATCH_WHISPERX_DEVICE=cuda for GPU.",
     )
+    ap.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help="Exact number of speakers for --diarize (strongest accuracy lever when you know the "
+             "headcount). Overrides WATCH_WHISPERX_NUM_SPEAKERS. Ignored without --diarize.",
+    )
     ap.add_argument("--sub-lang", default=None, help="Exact caption language preference (default auto/native)")
     cookies = ap.add_mutually_exclusive_group()
     cookies.add_argument("--cookies", default=None, help="Explicit cookie file (yt-dlp may update this jar)")
@@ -161,6 +169,8 @@ def main() -> int:
         ap.error("--diarize needs local transcription and conflicts with --no-whisper")
     if args.diarize and args.whisper in ("groq", "openai"):
         ap.error("--diarize is local-only (WhisperX + pyannote); it conflicts with --whisper groq/openai")
+    if args.num_speakers is not None and args.num_speakers < 1:
+        ap.error("--num-speakers must be a positive integer")
 
     config = get_config(backend_override="none" if args.no_whisper else args.whisper)
     detail = args.detail or config["detail"]
@@ -296,7 +306,7 @@ def main() -> int:
                     device=config["whisperx_device"],
                     compute_type=config["whisperx_compute_type"],
                     diarize_model=config["whisperx_diarize_model"],
-                    num_speakers=_int(config["whisperx_num_speakers"]),
+                    num_speakers=args.num_speakers if args.num_speakers is not None else _int(config["whisperx_num_speakers"]),
                     min_speakers=_int(config["whisperx_min_speakers"]),
                     max_speakers=_int(config["whisperx_max_speakers"]),
                     threshold=_float(config["whisperx_diarize_threshold"]),
