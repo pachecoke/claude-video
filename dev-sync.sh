@@ -18,6 +18,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_KEY="watch@pachecoke-claude-video"
 INSTALLED_JSON="${HOME}/.claude/plugins/installed_plugins.json"
 
+# Resolve a working Python interpreter. On Windows, bare `python3` is the
+# Microsoft Store alias that is on PATH but fails, so test each candidate by
+# actually running it rather than trusting `command -v`.
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c '' >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+if [[ -z "$PY" ]]; then
+  echo "error: no working Python interpreter found (tried python3, python, py)" >&2
+  exit 1
+fi
+
 DRY_RUN=()
 DEST=""
 for arg in "$@"; do
@@ -37,7 +51,7 @@ if [[ -z "$DEST" ]]; then
     echo "error: $INSTALLED_JSON not found; pass an install path explicitly" >&2
     exit 1
   fi
-  DEST="$(PLUGIN_KEY="$PLUGIN_KEY" python3 - "$INSTALLED_JSON" <<'PY'
+  DEST="$(PLUGIN_KEY="$PLUGIN_KEY" "$PY" - "$INSTALLED_JSON" <<'PY'
 import json, os, sys
 data = json.load(open(sys.argv[1]))
 key = os.environ["PLUGIN_KEY"]
@@ -68,20 +82,47 @@ echo "dest:   $DEST"
 echo
 
 # Mirror shipped files only. Dev-only artifacts and runtime state are excluded.
-# No --delete: the cache holds runtime state (.in_use/) we must not touch.
-rsync -a ${DRY_RUN[@]+"${DRY_RUN[@]}"} \
-  --exclude '.git/' \
-  --exclude '.venv/' \
-  --exclude '.pytest_cache/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  --exclude '.DS_Store' \
-  --exclude '.in_use/' \
-  --exclude 'tests/' \
-  --exclude 'docs/' \
-  --exclude 'dist/' \
-  --exclude 'V2_*.md' \
-  --exclude 'dev-sync.sh' \
-  "$REPO_ROOT/" "$DEST/"
+# No delete: the cache holds runtime state (.in_use/) we must not touch.
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a ${DRY_RUN[@]+"${DRY_RUN[@]}"} \
+    --exclude '.git/' \
+    --exclude '.venv/' \
+    --exclude '.pytest_cache/' \
+    --exclude '__pycache__/' \
+    --exclude '*.pyc' \
+    --exclude '.DS_Store' \
+    --exclude '.in_use/' \
+    --exclude 'tests/' \
+    --exclude 'docs/' \
+    --exclude 'dist/' \
+    --exclude 'V2_*.md' \
+    --exclude 'dev-sync.sh' \
+    "$REPO_ROOT/" "$DEST/"
+else
+  # No rsync (e.g. Git Bash on Windows): copy with Python, same excludes, no delete.
+  DRY="0"
+  if [[ ${#DRY_RUN[@]} -gt 0 ]]; then DRY="1"; fi
+  SRC="$REPO_ROOT" DST="$DEST" DRY="$DRY" "$PY" - <<'PYCOPY'
+import fnmatch, os, shutil
+src, dst, dry = os.environ["SRC"], os.environ["DST"], os.environ["DRY"] == "1"
+patterns = ['.git', '.venv', '.pytest_cache', '__pycache__', '*.pyc',
+            '.DS_Store', '.in_use', 'tests', 'docs', 'dist', 'V2_*.md', 'dev-sync.sh']
+def excluded(name):
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+for root, dirs, files in os.walk(src):
+    dirs[:] = [d for d in dirs if not excluded(d)]
+    rel = os.path.relpath(root, src)
+    for f in files:
+        if excluded(f):
+            continue
+        r = f if rel == "." else os.path.join(rel, f)
+        d = os.path.join(dst, r)
+        if dry:
+            print("would copy", r)
+        else:
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            shutil.copy2(os.path.join(root, f), d)
+PYCOPY
+fi
 
 echo "done."
